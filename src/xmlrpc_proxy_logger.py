@@ -1,7 +1,32 @@
 # xmlrpc_proxy_logger.py
+
+# Copyright 2025, Bill Bennett, N7DZ
+#
+# Originally built as a debugging tool to sit between kcat and 
+# fldigi to examine rpcxml interactions between those two. 
+# Hopefully useful more generally. 
+# 
+# This is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# The software is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with fldigi.  If not, see <http:#www.gnu.org/licenses/>.
+#
+# This code was developed with support from Jules, my ChatGPT-based coding assistant. 
+#
+# Please report all bugs and problems to n7dz@arrl.net.
+
 import argparse
 import time
 import threading
+import sys
 from xmlrpc.server import SimpleXMLRPCRequestHandler
 from xmlrpc.server import SimpleXMLRPCServer as BaseServer
 from socketserver import ThreadingMixIn
@@ -132,10 +157,24 @@ if args.interactive:
 
     import code
     interactive_url = f"http://localhost:{PROXY_PORT}"
-    interactive_proxy = xmlrpc.client.ServerProxy(interactive_url, allow_none=True)
-    namespace = {'proxy': interactive_proxy, 'log': lambda m: log_event("SHELL", m)}
-    log_event("SHELL", "Entering interactive mode (use 'proxy.method(...)')")
-    code.interact(local=namespace)
+    def call(method, *args):
+        with xmlrpc.client.ServerProxy(interactive_url, allow_none=True) as proxy:
+            for part in method.split('.'):
+                proxy = getattr(proxy, part)
+            return proxy(*args)
+
+    namespace = {
+        'call': call,
+        'log': lambda m: log_event("SHELL", m),
+        'quit': lambda: exit(),
+        'exit': lambda: exit(),
+    }
+    log_event("SHELL", "Entering interactive mode (use 'call(\"method\", ...)')")
+    try:
+        code.interact(local=namespace)
+    except KeyboardInterrupt:
+        print("KeyboardInterrupt — exiting.")
+        sys.exit()
 else:
     server.serve_forever()
 
