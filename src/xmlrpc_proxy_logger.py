@@ -157,11 +157,27 @@ if args.interactive:
 
     import code
     interactive_url = f"http://localhost:{PROXY_PORT}"
+    class NoKeepAliveTransport(xmlrpc.client.Transport):
+        def request(self, host, handler, request_body, verbose=False):
+            self._extra_headers = [("Connection", "close")]
+            response = super().request(host, handler, request_body, verbose)
+            if hasattr(self, "_connection") and isinstance(self._connection, dict):
+                self._connection.pop(host, None)
+            return response
+
     def call(method, *args):
-        with xmlrpc.client.ServerProxy(interactive_url, allow_none=True) as proxy:
+        transport = NoKeepAliveTransport()
+        with xmlrpc.client.ServerProxy(interactive_url, allow_none=True, transport=transport) as proxy:
             for part in method.split('.'):
                 proxy = getattr(proxy, part)
-            return proxy(*args)
+            result = proxy(*args)
+            # if isinstance(result, dict) and result.get('faultString') == 'Request-sent':
+#     log_event("RETRY", f"Retrying {method} due to fault response: {result}")
+#     with xmlrpc.client.ServerProxy(interactive_url, allow_none=True, transport=transport) as retry_proxy:
+#         for part in method.split('.'):
+#             retry_proxy = getattr(retry_proxy, part)
+#         return retry_proxy(*args)
+            return result
 
     namespace = {
         'call': call,
