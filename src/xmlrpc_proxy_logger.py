@@ -6,20 +6,29 @@
 # fldigi to examine rpcxml interactions between those two. 
 # Hopefully useful more generally. 
 # 
-# This is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
+# This tool runs an xmlrpc server and client, and passes through
+# all traffic from server to client. Ports of both are configurable,
+# as well as the address of the target server. Traffic is logged to
+# the terminal session or to a file. The purpose is to allow 
+# examining traffic for reverse-engineering or debugging. 
 #
+# Specific method names can be renamed in passing, or blocked. 
+# 
 # The software is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
 #
+# This is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
 # You should have received a copy of the GNU General Public License
 # along with fldigi.  If not, see <http:#www.gnu.org/licenses/>.
 #
-# This code was developed with support from Jules, my ChatGPT-based coding assistant. 
+# This code was developed with support from Jules, my ChatGPT-based 
+# coding assistant. 
 #
 # Please report all bugs and problems to n7dz@arrl.net.
 
@@ -31,6 +40,8 @@ from xmlrpc.server import SimpleXMLRPCRequestHandler
 from xmlrpc.server import SimpleXMLRPCServer as BaseServer
 from socketserver import ThreadingMixIn
 import xmlrpc.client
+import code
+import queue
 
 # Parse command-line arguments
 parser = argparse.ArgumentParser(description="XML-RPC Proxy Logger")
@@ -69,12 +80,15 @@ def log_event(label, message):
     if log_file:
         print(line, file=log_file, flush=True)
 
+# Shared task queue for XML-RPC calls
+rpc_queue = queue.Queue()
+
 url = f"http://{TARGET_HOST}:{TARGET_PORT}"
 print(f"Starting XML-RPC proxy:")
 print(f"  Listening on port {PROXY_PORT}")
 print(f"  Forwarding to {url}")
 
-target = xmlrpc.client.ServerProxy(url, allow_none=True)
+# target = xmlrpc.client.ServerProxy(url, allow_none=True)  # moved to dispatcher
 
 if args.list_methods:
     try:
@@ -105,6 +119,9 @@ class QuietRequestHandler(SimpleXMLRPCRequestHandler):
 class ThreadingXMLRPCServer(ThreadingMixIn, BaseServer):
     pass
 
+def enqueue_rpc_call(method, params, response_queue=None):
+    rpc_queue.put((method, params, response_queue))
+
 class ProxyHandler:
     def _dispatch(self, method, params):
         log_event("CALL", f"{method}({params})")
@@ -125,8 +142,10 @@ class ProxyHandler:
                     mname = call['methodName']
                     mparams = call.get('params', [])
                     log_event("MULTICALL", f"{mname}({mparams})")
-                    func = getattr(target, mname)
-                    result = func(*mparams)
+                    # Forward to dispatcher thread
+                    response_q = queue.Queue()
+                    enqueue_rpc_call(mname, mparams, response_q)
+                    result = response_q.get()
                     log_event("RESULT", f"{mname} -> {result}")
                     results.append([result])
                 except Exception as e:
@@ -135,13 +154,32 @@ class ProxyHandler:
             return results
 
         try:
-            func = getattr(target, method)
-            result = func(*params)
+            # Forward to dispatcher thread
+            response_q = queue.Queue()
+            enqueue_rpc_call(method, params, response_q)
+            result = response_q.get()
             log_event("RESULT", f"{method} -> {result}")
             return result
         except Exception as e:
             log_event("ERROR", f"{method} failed: {e}")
             return {'faultCode': 1, 'faultString': str(e)}
+
+def rpc_dispatcher():
+    target = xmlrpc.client.ServerProxy(url, allow_none=True)
+    while True:
+        method, params, response_q = rpc_queue.get()
+        try:
+            func = getattr(target, method)
+            result = func(*params)
+            log_event("RESULT", f"{method} -> {result}")
+        except Exception as e:
+            result = {'faultCode': 1, 'faultString': str(e)}
+            log_event("ERROR", f"{method} failed: {e}")
+        if response_q:
+            response_q.put(result)
+
+# Start the dispatcher thread
+threading.Thread(target=rpc_dispatcher, daemon=True).start()
 
 server = ThreadingXMLRPCServer(('', PROXY_PORT), requestHandler=QuietRequestHandler, allow_none=True)
 server.quiet_mode = args.quiet
@@ -155,7 +193,6 @@ if args.interactive:
     thread = threading.Thread(target=run_server, daemon=True)
     thread.start()
 
-    import code
     interactive_url = f"http://localhost:{PROXY_PORT}"
     class NoKeepAliveTransport(xmlrpc.client.Transport):
         def request(self, host, handler, request_body, verbose=False):
@@ -166,18 +203,9 @@ if args.interactive:
             return response
 
     def call(method, *args):
-        transport = NoKeepAliveTransport()
-        with xmlrpc.client.ServerProxy(interactive_url, allow_none=True, transport=transport) as proxy:
-            for part in method.split('.'):
-                proxy = getattr(proxy, part)
-            result = proxy(*args)
-            # if isinstance(result, dict) and result.get('faultString') == 'Request-sent':
-#     log_event("RETRY", f"Retrying {method} due to fault response: {result}")
-#     with xmlrpc.client.ServerProxy(interactive_url, allow_none=True, transport=transport) as retry_proxy:
-#         for part in method.split('.'):
-#             retry_proxy = getattr(retry_proxy, part)
-#         return retry_proxy(*args)
-            return result
+        response_q = queue.Queue()
+        enqueue_rpc_call(method, args, response_q)
+        return response_q.get()
 
     namespace = {
         'call': call,
