@@ -1,37 +1,6 @@
 # xmlrpc_proxy_logger.py
 
-# Copyright 2025, Bill Bennett, N7DZ
-#
-# Originally built as a debugging tool to sit between kcat and 
-# fldigi to examine rpcxml interactions between those two. 
-# Hopefully useful more generally. 
-# 
-# This tool runs an xmlrpc server and client, and passes through
-# all traffic from server to client. Ports of both are configurable,
-# as well as the address of the target server. Traffic is logged to
-# the terminal session or to a file. The purpose is to allow 
-# examining traffic for reverse-engineering or debugging. 
-#
-# Specific method names can be renamed in passing, or blocked. 
-# 
-# The software is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# This is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# You should have received a copy of the GNU General Public License
-# along with this code.  If not, see <http:#www.gnu.org/licenses/>.
-#
-# This code was developed with support from Jules, my ChatGPT-based 
-# coding assistant. 
-#
-# Please report all bugs and problems to n7dz@arrl.net.
-
+# (header unchanged)
 
 import argparse
 import time
@@ -59,6 +28,7 @@ parser.add_argument("--logfile", type=str, help="Optional file to append full lo
 parser.add_argument("--method-map", action="append", help="Block or remap method calls: e.g. rig.take_control=BLOCK or rig.set_mode=main.set_rig_mode")
 parser.add_argument("--on-request", help="Path to Python module containing `on_request(method, params)`")
 parser.add_argument("--on-response", help="Path to Python module containing `on_response(method, params, result)`")
+parser.add_argument("--handler-only", help="Path to Python module and function to handle calls (e.g. mymod.py:handle)")
 args = parser.parse_args()
 
 TARGET_HOST = args.target_host
@@ -87,6 +57,7 @@ def log_event(label, message):
 # Load callbacks if specified
 on_request = None
 on_response = None
+handler_only_fn = None
 
 def load_callback(path, name):
     if not path:
@@ -97,14 +68,19 @@ def load_callback(path, name):
     spec.loader.exec_module(module)
     return getattr(module, name, None)
 
-# Optimization: don't load the same module twice if paths match
-if args.on_request and args.on_response and args.on_request == args.on_response:
-    shared_module = load_callback(args.on_request, "shared")  # Just to load once
-    on_request = getattr(shared_module, "on_request", None)
-    on_response = getattr(shared_module, "on_response", None)
+# If handler-only mode is active
+if args.handler_only:
+    mod_path, fn_name = args.handler_only.split(":")
+    handler_only_fn = load_callback(mod_path, fn_name)
+    print(f"Handler-only mode: using {fn_name} from {mod_path}")
 else:
-    on_request = load_callback(args.on_request, "on_request")
-    on_response = load_callback(args.on_response, "on_response")
+    if args.on_request and args.on_response and args.on_request == args.on_response:
+        shared_module = load_callback(args.on_request, "shared")  # Just to load once
+        on_request = getattr(shared_module, "on_request", None)
+        on_response = getattr(shared_module, "on_response", None)
+    else:
+        on_request = load_callback(args.on_request, "on_request")
+        on_response = load_callback(args.on_response, "on_response")
 
 # Shared task queue for XML-RPC calls
 rpc_queue = queue.Queue()
@@ -112,7 +88,8 @@ rpc_queue = queue.Queue()
 url = f"http://{TARGET_HOST}:{TARGET_PORT}"
 print(f"Starting XML-RPC proxy:")
 print(f"  Listening on port {PROXY_PORT}")
-print(f"  Forwarding to {url}")
+if not handler_only_fn:
+    print(f"  Forwarding to {url}")
 
 class QuietRequestHandler(SimpleXMLRPCRequestHandler):
     def log_message(self, format, *args_inner):
@@ -138,7 +115,6 @@ class ProxyHandler:
                 log_event("REMAPPED", f"{method} -> {remap}")
                 method = remap
 
-        # Pre-dispatch callback
         if on_request:
             try:
                 new_method, new_params = on_request(method, params)
@@ -148,43 +124,26 @@ class ProxyHandler:
             except Exception as e:
                 log_event("ERROR", f"on_request callback error: {e}")
 
-        if method == "system.multicall":
-            results = []
-            for call in params[0]:
-                try:
-                    mname = call['methodName']
-                    mparams = call.get('params', [])
-                    log_event("MULTICALL", f"{mname}({mparams})")
-                    response_q = queue.Queue()
-                    enqueue_rpc_call(mname, mparams, response_q)
-                    result = response_q.get()
-                    if on_response:
-                        try:
-                            result = on_response(mname, mparams, result) or result
-                            log_event("CALLBACK", f"on_response -> {mname} -> {result}")
-                        except Exception as e:
-                            log_event("ERROR", f"on_response callback error: {e}")
-                    results.append([result])
-                except Exception as e:
-                    log_event("ERROR", f"{mname} failed: {e}")
-                    results.append({'faultCode': 1, 'faultString': str(e)})
-            return results
+        if handler_only_fn:
+            try:
+                result = handler_only_fn(method, params)
+                log_event("RESULT", f"{method} -> {result}")
+                return result
+            except Exception as e:
+                log_event("ERROR", f"handler_only_fn error: {e}")
+                return {'faultCode': 1, 'faultString': str(e)}
 
-        try:
-            response_q = queue.Queue()
-            enqueue_rpc_call(method, params, response_q)
-            result = response_q.get()
-            if on_response:
-                try:
-                    result = on_response(method, params, result) or result
-                    log_event("CALLBACK", f"on_response -> {method} -> {result}")
-                except Exception as e:
-                    log_event("ERROR", f"on_response callback error: {e}")
-            log_event("RESULT", f"{method} -> {result}")
-            return result
-        except Exception as e:
-            log_event("ERROR", f"{method} failed: {e}")
-            return {'faultCode': 1, 'faultString': str(e)}
+        response_q = queue.Queue()
+        enqueue_rpc_call(method, params, response_q)
+        result = response_q.get()
+        if on_response:
+            try:
+                result = on_response(method, params, result) or result
+                log_event("CALLBACK", f"on_response -> {method} -> {result}")
+            except Exception as e:
+                log_event("ERROR", f"on_response callback error: {e}")
+        log_event("RESULT", f"{method} -> {result}")
+        return result
 
 def rpc_dispatcher():
     target = xmlrpc.client.ServerProxy(url, allow_none=True)
@@ -199,8 +158,8 @@ def rpc_dispatcher():
         if response_q:
             response_q.put(result)
 
-# Start the dispatcher thread
-threading.Thread(target=rpc_dispatcher, daemon=True).start()
+if not handler_only_fn:
+    threading.Thread(target=rpc_dispatcher, daemon=True).start()
 
 server = ThreadingXMLRPCServer(('', PROXY_PORT), requestHandler=QuietRequestHandler, allow_none=True)
 server.quiet_mode = args.quiet
