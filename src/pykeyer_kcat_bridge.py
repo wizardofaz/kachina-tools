@@ -36,7 +36,7 @@ def _start_listener():
                         break  # client closed connection
 
                     command = data.decode("utf-8").strip()
-                    print(f"[listener] Received from {addr}: {command}")
+                    #print(f"[listener] Received from {addr}: {command}")
 
                     if command == "<CMD>get_frequency</CMD>":
                         value = state["frequency"]
@@ -99,7 +99,7 @@ def _start_listener():
     atexit.register(shutdown_listener)
 
 def handle(method, params):
-    print(f"[handler] Received method call: {method} with params: {params}")
+    #print(f"[handler] Received method call: {method} with params: {params}")
 
     retval = None
 
